@@ -1,5 +1,5 @@
 import os
-import sqlite3
+from core.db import get_db
 from eth_account import Account
 from cryptography.fernet import Fernet
 from typing import Optional
@@ -19,18 +19,38 @@ cipher = Fernet(MASTER_KEY.encode())
 DB_PATH = "sniper_wallets.db"
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    from core.db import get_db
+    with get_db(DB_PATH) as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS users
                         (chat_id TEXT PRIMARY KEY, 
                          wallet_address TEXT, 
                          encrypted_private_key TEXT)''')
-        # Migration: Add referrer tracking
-        try:
+                         
+    try:
+        with get_db(DB_PATH) as conn:
             conn.execute('ALTER TABLE users ADD COLUMN referrer_id TEXT')
             conn.execute('ALTER TABLE users ADD COLUMN referral_rewards_eth REAL DEFAULT 0.0')
-        except sqlite3.OperationalError:
-            pass # Columns already exist
-            
+    except Exception:
+        pass # Columns already exist
+        
+    try:
+        with get_db(DB_PATH) as conn:
+            conn.execute('ALTER TABLE users ADD COLUMN mev_tip_eth REAL DEFAULT 0.0')
+    except Exception:
+        pass # Column already exists
+        
+    with get_db(DB_PATH) as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS copy_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT,
+                target_address TEXT,
+                max_spend_eth REAL,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+        
+    with get_db(DB_PATH) as conn:
         conn.execute('''
             CREATE TABLE IF NOT EXISTS limit_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,10 +62,11 @@ def init_db():
             )
         ''')
 
+
 def get_or_create_wallet(chat_id: str, referrer_id: Optional[str] = None) -> dict:
     init_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    with get_db(DB_PATH) as conn:
+        
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
@@ -74,8 +95,8 @@ def get_or_create_wallet(chat_id: str, referrer_id: Optional[str] = None) -> dic
 
 def get_wallet_by_chat_id(chat_id: str) -> Optional[dict]:
     init_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    with get_db(DB_PATH) as conn:
+        
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
@@ -99,7 +120,7 @@ def import_wallet(chat_id: str, private_key: str) -> str:
     enc_pk = cipher.encrypt(private_key.encode()).decode()
     
     init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT chat_id FROM users WHERE chat_id = ?", (chat_id,))
         existing = cursor.fetchone()
@@ -113,12 +134,12 @@ def import_wallet(chat_id: str, private_key: str) -> str:
 
 def add_referral_reward(chat_id: str, amount_eth: float):
     init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db(DB_PATH) as conn:
         conn.execute("UPDATE users SET referral_rewards_eth = referral_rewards_eth + ? WHERE chat_id = ?", (amount_eth, chat_id))
 
 def get_referral_stats(chat_id: str) -> dict:
     init_db()
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (chat_id,))
         count = cursor.fetchone()[0]
@@ -132,7 +153,7 @@ def create_limit_order(chat_id: str, token_address: str, target_percentage: floa
     from core.watchlist_engine import get_real_price
     entry_price = get_real_price(token_address)
     
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO limit_orders (chat_id, token_address, target_percentage, entry_price, status) VALUES (?, ?, ?, ?, 'PENDING')",
@@ -142,12 +163,69 @@ def create_limit_order(chat_id: str, token_address: str, target_percentage: floa
 
 def get_pending_orders() -> list:
     init_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    with get_db(DB_PATH) as conn:
+        
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM limit_orders WHERE status = 'PENDING'")
         return [dict(row) for row in cursor.fetchall()]
 
 def mark_order_executed(order_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_db(DB_PATH) as conn:
         conn.execute("UPDATE limit_orders SET status = 'EXECUTED' WHERE id = ?", (order_id,))
+
+def set_mev_tip(chat_id: str, tip_amount: float):
+    init_db()
+    with get_db(DB_PATH) as conn:
+        conn.execute("UPDATE users SET mev_tip_eth = ? WHERE chat_id = ?", (tip_amount, chat_id))
+
+def get_mev_tip(chat_id: str) -> float:
+    init_db()
+    with get_db(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT mev_tip_eth FROM users WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        return float(row['mev_tip_eth']) if row and row['mev_tip_eth'] else 0.0
+
+def add_copy_target(chat_id: str, target: str, max_spend: float):
+    init_db()
+    with get_db(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO copy_targets (chat_id, target_address, max_spend_eth, is_active) VALUES (?, ?, ?, 1)",
+            (chat_id, target.lower(), max_spend)
+        )
+
+def remove_copy_target(chat_id: str, target: str):
+    init_db()
+    with get_db(DB_PATH) as conn:
+        conn.execute("DELETE FROM copy_targets WHERE chat_id = ? AND target_address = ?", (chat_id, target.lower()))
+
+def toggle_copy_target(chat_id: str, target: str, is_active: int):
+    init_db()
+    with get_db(DB_PATH) as conn:
+        conn.execute("UPDATE copy_targets SET is_active = ? WHERE chat_id = ? AND target_address = ?", (is_active, chat_id, target.lower()))
+
+def get_copy_targets(chat_id: str) -> list:
+    init_db()
+    with get_db(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM copy_targets WHERE chat_id = ?", (chat_id,))
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_all_active_copy_targets() -> list:
+    init_db()
+    with get_db(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM copy_targets WHERE is_active = 1")
+        return [dict(row) for row in cursor.fetchall()]
+
+def get_entry_price(chat_id: str, token_address: str) -> float:
+    init_db()
+    from core.db import get_db
+    with get_db("sniper_wallets.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT entry_price FROM limit_orders WHERE chat_id = ? AND token_address = ? ORDER BY id DESC LIMIT 1",
+            (chat_id, token_address.lower())
+        )
+        row = cursor.fetchone()
+        return float(row['entry_price']) if row and row['entry_price'] else 0.0
